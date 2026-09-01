@@ -1,3 +1,4 @@
+import os
 import asyncio
 import html
 import logging
@@ -13,7 +14,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-TOKEN = "8951474107:AAHLBI_7fIOjw70mNg5_qcPu2v9UGyCTk6k"
+TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_CHAT_ID = 8536087082  # Your personal Telegram ID
 
 # In-memory data stores
