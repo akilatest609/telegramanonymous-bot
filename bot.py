@@ -515,12 +515,12 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if message.text and message.text.startswith("/start"):
         await message.reply_text(
-            "👋 Welcome! Send any request, movie name, or file code here, and admin will get back to you shortly."
+            "සාදරයෙන් පිලිගන්නවා 💕, ඇඩ්මින් ට එවන්න ඔනෙ මැසෙජ් එක ටයිප් කරලා එවන්න, ."
         )
         return
 
     user_registry.add_user(user.id, user.username, user.first_name)
-    header = f"📩 **File Request / From:** {user.first_name} (`{user.id}`)\n\n"
+    header = f"📩 **msg / From:** {user.first_name} (`{user.id}`)\n\n"
     
     try:
         await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=header, parse_mode="Markdown")
