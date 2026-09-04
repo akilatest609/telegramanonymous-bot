@@ -127,7 +127,7 @@ def get_admin_menu_keyboard(batch_active=False):
     ]
     if batch_active:
         buttons.append([InlineKeyboardButton("🛑 End & Dispatch Active Batch", callback_data="menu_batch_end_action")])
-    
+
     buttons.extend([
         [InlineKeyboardButton("💬 Chat Relay Guide", callback_data="menu_chat_guide")],
         [InlineKeyboardButton("📦 Batch Mode Guide", callback_data="menu_batch_guide")],
@@ -153,12 +153,12 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = user_registry.get_all_users()
     blocked_count = user_registry.get_blocked_count()
     keyboard = []
-    
+
     if not users:
         text = f"📂 **Bot Statistics**\n\n• Total Active Users: `0`\n• Blocked Users: `{blocked_count}`"
     else:
         text = f"📊 **Bot Statistics**\n\n• Total Users: `{len(users)}`\n• Blocked Users: `{blocked_count}`\n\n"
-        for uid, uname, fname, joined in users[:15]: 
+        for uid, uname, fname, joined in users[:15]:
             username_str = f"@{uname}" if uname else "No username"
             status_tag = " 🚫 [BLOCKED]" if user_registry.is_blocked(uid) else ""
             text += f"• **{fname or 'Unknown'}** ({username_str}){status_tag}\n  ID: `{uid}` | Joined: `{joined}`\n\n"
@@ -166,7 +166,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"{fname or 'Unknown'} [ID: {uid}]", callback_data=f"noop_{uid}"),
                 InlineKeyboardButton("❌", callback_data=f"del_user_{uid}")
             ])
-    
+
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -199,7 +199,7 @@ async def show_block_user_selection(update: Update, context: ContextTypes.DEFAUL
         ])
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
     markup = InlineKeyboardMarkup(keyboard)
-    
+
     if is_edit:
         await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
@@ -247,7 +247,7 @@ async def show_unblock_user_selection(update: Update, context: ContextTypes.DEFA
         ])
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
     markup = InlineKeyboardMarkup(keyboard)
-    
+
     if is_edit:
         await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
@@ -329,10 +329,10 @@ async def show_batch_user_selection(update: Update, context: ContextTypes.DEFAUL
             InlineKeyboardButton(f"{name} {uname_str} [ID: {uid}]", callback_data=f"batch_choose_{uid}"),
             InlineKeyboardButton("❌", callback_data=f"del_user_{uid}")
         ])
-    
+
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
     markup = InlineKeyboardMarkup(keyboard)
-    
+
     if is_edit:
         await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
@@ -388,12 +388,12 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("batch_timer_"):
         seconds_to_add = int(data.split("_")[2])
         current_timer = context.user_data.get('batch_delete_timer', 0)
-        
+
         if seconds_to_add == 0:
             new_timer = 0
         else:
             new_timer = current_timer + seconds_to_add
-            
+
         context.user_data['batch_delete_timer'] = new_timer
         target_id = context.user_data.get('batch_target_id')
         if target_id:
@@ -430,7 +430,7 @@ async def update_batch_panel(query, target_id, delete_timer_sec):
         hours = delete_timer_sec // 3600
         minutes = (delete_timer_sec % 3600) // 60
         seconds = delete_timer_sec % 60
-        
+
         parts = []
         if hours > 0:
             parts.append(f"{hours}h")
@@ -533,42 +533,57 @@ async def execute_batch_end(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     total_items = len(queue)
-    status_msg = await source_msg.reply_text(f"🚀 Dispatching {total_items} files in safe chunks to user `{target_id}`...")
+    status_msg = await source_msg.reply_text(f"🚀 Dispatching {total_items} files to user `{target_id}`...")
 
     actual_sent_ids = []
+    failed_ids = []
     chunk_size = 100
 
-    try:
-        for i in range(0, total_items, chunk_size):
-            chunk = queue[i:i + chunk_size]
-            
+    for i in range(0, total_items, chunk_size):
+        chunk = queue[i:i + chunk_size]
+        try:
+            # Try the fast bulk copy first
             sent_msg_ids = await context.bot.copy_messages(
                 chat_id=target_id,
                 from_chat_id=ALLOWED_USER_ID,
                 message_ids=chunk
             )
-            
             actual_sent_ids.extend([m.message_id for m in sent_msg_ids])
+        except Exception as e:
+            logger.warning(f"Chunk copy failed ({e}), falling back to one-by-one for this chunk")
+            # Fall back: copy one at a time so a single bad message doesn't kill the whole chunk
+            for msg_id in chunk:
+                try:
+                    sent = await context.bot.copy_message(
+                        chat_id=target_id,
+                        from_chat_id=ALLOWED_USER_ID,
+                        message_id=msg_id
+                    )
+                    actual_sent_ids.append(sent.message_id)
+                except Exception as inner_e:
+                    logger.error(f"Skipping message {msg_id}: {inner_e}")
+                    failed_ids.append(msg_id)
+                await asyncio.sleep(0.1)  # tiny pacing to avoid flood limits
 
-            if i + chunk_size < total_items:
-                await asyncio.sleep(2.5)
+        if i + chunk_size < total_items:
+            await asyncio.sleep(2.5)
 
-        if delete_timer > 0:
-            asyncio.create_task(delete_messages_after_delay(context.bot, target_id, actual_sent_ids, delete_timer))
-            timer_str = f"⏱️ Auto-deleting in {delete_timer}s"
-        else:
-            timer_str = "No auto-delete"
+    if delete_timer > 0 and actual_sent_ids:
+        asyncio.create_task(delete_messages_after_delay(context.bot, target_id, actual_sent_ids, delete_timer))
+        timer_str = f"⏱️ Auto-deleting in {delete_timer}s"
+    else:
+        timer_str = "No auto-delete"
 
-        await status_msg.edit_text(
-            f"✅ **Batch Delivery Complete**\n\n"
-            f"• Target ID: `{target_id}`\n"
-            f"• Successfully Sent: `{total_items}` files\n"
-            f"• Timer: `{timer_str}`",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Failed to copy batch messages: {e}")
-        await status_msg.edit_text(f"❌ Failed to dispatch batch: {e}")
+    result_text = (
+        f"✅ **Batch Delivery Finished**\n\n"
+        f"• Target ID: `{target_id}`\n"
+        f"• Successfully Sent: `{len(actual_sent_ids)}` / `{total_items}`\n"
+        f"• Timer: `{timer_str}`"
+    )
+    if failed_ids:
+        result_text += f"\n\n⚠️ Skipped `{len(failed_ids)}` invalid/undeliverable message(s): `{failed_ids}`"
+
+    await status_msg.edit_text(result_text, parse_mode="Markdown")
 
 @restricted
 async def cmd_batch_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,7 +603,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if message.reply_to_message:
         reply_id = message.reply_to_message.message_id
         target_user_id = user_registry.get_user_by_admin_msg(reply_id)
-        
+
         if target_user_id:
             try:
                 sent_msg = await context.bot.copy_message(
@@ -621,11 +636,11 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     user_registry.add_user(user.id, user.username, user.first_name)
-    
+
     # Make the name clickable using the Telegram user link scheme
     clickable_name = f"[{user.first_name}](tg://user?id={user.id})"
     header = f"📩 **msg/ From:** {clickable_name} (`{user.id}`)\n\n"
-    
+
     try:
         await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=header, parse_mode="Markdown")
         forwarded_msg = await context.bot.copy_message(
@@ -647,7 +662,7 @@ async def main():
     application.add_handler(CommandHandler("broadcast", cmd_broadcast, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("batch_start", cmd_batch_start, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("batch_end", cmd_batch_end, filters.User(ALLOWED_USER_ID)))
-    
+
     application.add_handler(CallbackQueryHandler(menu_callback_handler, pattern="^(menu_|batch_choose_|batch_timer_|del_user_|block_action_|unblock_action_|noop_|block_noop_|unblock_noop_)"))
 
     application.add_handler(MessageHandler(filters.User(ALLOWED_USER_ID) & ~filters.COMMAND, handle_admin_message))
