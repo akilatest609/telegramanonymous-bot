@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sqlite3
 from functools import wraps
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -61,6 +61,13 @@ class UserRegistry:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id, username, first_name, joined_at FROM users")
             return cursor.fetchall()
+
+    def delete_user(self, user_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM chat_map WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+            conn.commit()
 
     def map_admin_message(self, admin_msg_id: int, user_id: int):
         with sqlite3.connect(self.db_path) as conn:
@@ -145,21 +152,57 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = user_registry.get_all_users()
     blocked_count = user_registry.get_blocked_count()
+    keyboard = []
+    
     if not users:
         text = f"📂 **Bot Statistics**\n\n• Total Active Users: `0`\n• Blocked Users: `{blocked_count}`"
     else:
         text = f"📊 **Bot Statistics**\n\n• Total Users: `{len(users)}`\n• Blocked Users: `{blocked_count}`\n\n"
-        for uid, uname, fname, joined in users[:15]:  # Show latest 15 users to prevent message overflow
+        for uid, uname, fname, joined in users[:15]: 
             username_str = f"@{uname}" if uname else "No username"
             status_tag = " 🚫 [BLOCKED]" if user_registry.is_blocked(uid) else ""
             text += f"• **{fname or 'Unknown'}** ({username_str}){status_tag}\n  ID: `{uid}` | Joined: `{joined}`\n\n"
+            keyboard.append([
+                InlineKeyboardButton(f"{fname or 'Unknown'} [ID: {uid}]", callback_data=f"noop_{uid}"),
+                InlineKeyboardButton("❌", callback_data=f"del_user_{uid}")
+            ])
     
-    keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data="menu_main")]]
+    keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
     markup = InlineKeyboardMarkup(keyboard)
 
     if update.callback_query:
         await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
     elif update.message:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+async def show_block_user_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, is_edit=False):
+    users = user_registry.get_all_users()
+    active_users = [u for u in users if not user_registry.is_blocked(u[0])]
+    if not active_users:
+        text = "📂 No active unblocked users found to block."
+        keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data="menu_main")]]
+        markup = InlineKeyboardMarkup(keyboard)
+        if is_edit:
+            await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    text = "🚫 **Select User to Block:**\nChoose a user from the list below:"
+    keyboard = []
+    for uid, uname, fname, _ in active_users:
+        name = fname or "Unknown"
+        uname_str = f"(@{uname})" if uname else ""
+        keyboard.append([
+            InlineKeyboardButton(f"{name} {uname_str} [ID: {uid}]", callback_data=f"block_noop_{uid}"),
+            InlineKeyboardButton("🚫", callback_data=f"block_action_{uid}")
+        ])
+    keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
+    markup = InlineKeyboardMarkup(keyboard)
+    
+    if is_edit:
+        await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 @restricted
@@ -174,11 +217,41 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if not target_user_id:
-        await update.message.reply_text("⚠️ Reply to a user's forwarded message or provide a User ID: `/block <user_id>`", parse_mode="Markdown")
+        await show_block_user_selection(update, context, is_edit=False)
         return
 
     user_registry.block_user(target_user_id)
     await update.message.reply_text(f"🚫 User ID `{target_user_id}` has been blocked successfully.", parse_mode="Markdown")
+
+async def show_unblock_user_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, is_edit=False):
+    users = user_registry.get_all_users()
+    blocked_users = [u for u in users if user_registry.is_blocked(u[0])]
+    if not blocked_users:
+        text = "📂 No blocked users found."
+        keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data="menu_main")]]
+        markup = InlineKeyboardMarkup(keyboard)
+        if is_edit:
+            await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    text = "✅ **Select User to Unblock:**\nChoose a user from the list below:"
+    keyboard = []
+    for uid, uname, fname, _ in blocked_users:
+        name = fname or "Unknown"
+        uname_str = f"(@{uname})" if uname else ""
+        keyboard.append([
+            InlineKeyboardButton(f"{name} {uname_str} [ID: {uid}]", callback_data=f"unblock_noop_{uid}"),
+            InlineKeyboardButton("✅", callback_data=f"unblock_action_{uid}")
+        ])
+    keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
+    markup = InlineKeyboardMarkup(keyboard)
+    
+    if is_edit:
+        await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 @restricted
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,7 +265,7 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if not target_user_id:
-        await update.message.reply_text("⚠️ Reply to a user's forwarded message or provide a User ID: `/unblock <user_id>`", parse_mode="Markdown")
+        await show_unblock_user_selection(update, context, is_edit=False)
         return
 
     user_registry.unblock_user(target_user_id)
@@ -201,7 +274,12 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/broadcast <your announcement message>`", parse_mode="Markdown")
+        text = "📢 **Broadcast Mode**\n\nUsage: `/broadcast <your announcement message>`\nOr choose an action below:"
+        keyboard = [
+            [InlineKeyboardButton("📊 View Stats", callback_data="menu_stats")],
+            [InlineKeyboardButton("« Back to Menu", callback_data="menu_main")]
+        ]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
     broadcast_text = " ".join(context.args)
@@ -242,12 +320,15 @@ async def show_batch_user_selection(update: Update, context: ContextTypes.DEFAUL
             await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
         return
 
-    text = "👥 **Select Target User for Batch Mode:**\nChoose a user from the list below to begin recording files:"
+    text = "👥 **Select Target User for Batch Mode:**\nChoose a user from the list below or delete them:"
     keyboard = []
     for uid, uname, fname, _ in active_users:
         name = fname or "Unknown"
         uname_str = f"(@{uname})" if uname else ""
-        keyboard.append([InlineKeyboardButton(f"{name} {uname_str} [ID: {uid}]", callback_data=f"batch_choose_{uid}")])
+        keyboard.append([
+            InlineKeyboardButton(f"{name} {uname_str} [ID: {uid}]", callback_data=f"batch_choose_{uid}"),
+            InlineKeyboardButton("❌", callback_data=f"del_user_{uid}")
+        ])
     
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
     markup = InlineKeyboardMarkup(keyboard)
@@ -275,6 +356,26 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await cmd_stats(update, context)
     elif data == "menu_batch_select":
         await menu_batch_select(update, context)
+    elif data.startswith("noop_") or data.startswith("block_noop_") or data.startswith("unblock_noop_"):
+        await query.answer("ℹ️ User info button.")
+    elif data.startswith("del_user_"):
+        target_id = int(data.split("_")[2])
+        user_registry.delete_user(target_id)
+        await query.answer(f"🗑️ User {target_id} deleted from database.", show_alert=True)
+        try:
+            await cmd_stats(update, context)
+        except Exception:
+            await show_batch_user_selection(update, context, is_edit=True)
+    elif data.startswith("block_action_"):
+        target_id = int(data.split("_")[2])
+        user_registry.block_user(target_id)
+        await query.answer(f"🚫 User {target_id} has been blocked.", show_alert=True)
+        await show_block_user_selection(update, context, is_edit=True)
+    elif data.startswith("unblock_action_"):
+        target_id = int(data.split("_")[2])
+        user_registry.unblock_user(target_id)
+        await query.answer(f"✅ User {target_id} has been unblocked.", show_alert=True)
+        await show_unblock_user_selection(update, context, is_edit=True)
     elif data.startswith("batch_choose_"):
         target_id = int(data.split("_")[2])
         context.user_data['batch_active'] = True
@@ -515,12 +616,15 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if message.text and message.text.startswith("/start"):
         await message.reply_text(
-            "සාදරයෙන් පිලිගන්නවා 💕, ඇඩ්මින් ට එවන්න ඔනෙ මැසෙජ් එක ටයිප් කරලා එවන්න, ."
+            "සාදරයෙන් පිලිගන්නවා 💕, ඇඩ්මින් ට එවන්න ඔනෙ මැසෙජ් එක ටයිප් කරලා එවන්න, "
         )
         return
 
     user_registry.add_user(user.id, user.username, user.first_name)
-    header = f"📩 **msg / From:** {user.first_name} (`{user.id}`)\n\n"
+    
+    # Make the name clickable using the Telegram user link scheme
+    clickable_name = f"[{user.first_name}](tg://user?id={user.id})"
+    header = f"📩 **msg/ From:** {clickable_name} (`{user.id}`)\n\n"
     
     try:
         await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=header, parse_mode="Markdown")
@@ -544,7 +648,7 @@ async def main():
     application.add_handler(CommandHandler("batch_start", cmd_batch_start, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("batch_end", cmd_batch_end, filters.User(ALLOWED_USER_ID)))
     
-    application.add_handler(CallbackQueryHandler(menu_callback_handler, pattern="^(menu_|batch_choose_|batch_timer_)"))
+    application.add_handler(CallbackQueryHandler(menu_callback_handler, pattern="^(menu_|batch_choose_|batch_timer_|del_user_|block_action_|unblock_action_|noop_|block_noop_|unblock_noop_)"))
 
     application.add_handler(MessageHandler(filters.User(ALLOWED_USER_ID) & ~filters.COMMAND, handle_admin_message))
     application.add_handler(MessageHandler(~filters.User(ALLOWED_USER_ID), handle_user_message))
@@ -553,6 +657,13 @@ async def main():
     await application.initialize()
     await application.start()
 
+    # 1. Set global commands visible to EVERYONE (only show start)
+    await application.bot.set_my_commands(
+        [BotCommand("start", "Start the bot")],
+        scope=BotCommandScopeDefault()
+    )
+
+    # 2. Set admin-only commands visible ONLY to your Admin ID
     await application.bot.set_my_commands([
         BotCommand("start", "Open Admin Control Panel"),
         BotCommand("stats", "View Active Users & Blocked Count"),
@@ -561,7 +672,8 @@ async def main():
         BotCommand("broadcast", "Send announcement to all users"),
         BotCommand("batch_start", "Start a File Batch"),
         BotCommand("batch_end", "Dispatch Active Batch")
-    ])
+    ], scope=BotCommandScopeChat(chat_id=ALLOWED_USER_ID))
+
     await application.bot.set_chat_menu_button(
         chat_id=ALLOWED_USER_ID,
         menu_button=MenuButtonCommands()
