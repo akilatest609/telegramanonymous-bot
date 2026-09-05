@@ -2,7 +2,18 @@ import asyncio
 import logging
 import sqlite3
 from functools import wraps
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
+    InputMediaVideo,
+    InputMediaPhoto,
+    InputMediaDocument,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -45,6 +56,25 @@ class UserRegistry:
                 CREATE TABLE IF NOT EXISTS blocked_users (
                     user_id INTEGER PRIMARY KEY
                 )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS custom_buttons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    btn_text TEXT,
+                    btn_url TEXT
+                )
+            """)
+            conn.execute("""
+                INSERT OR IGNORE INTO bot_settings (key, value) VALUES 
+                ('welcome_text', 'ආයුබෝවන් යාලුවනේ 💋✨\nඇඩ්මින් ට එවන්න ඔනෙ මැසෙජ් එක ටයිප් කරලා එවන්න.'),
+                ('btn_pkg', '📦 Buy a Package'),
+                ('btn_contact', '💬 Contact Admin')
             """)
             conn.commit()
 
@@ -107,6 +137,34 @@ class UserRegistry:
             row = cursor.fetchone()
             return row[0] if row else 0
 
+    def get_setting(self, key: str) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else ""
+
+    def set_setting(self, key: str, value: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()
+
+    def get_custom_buttons(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, btn_text, btn_url FROM custom_buttons")
+            return cursor.fetchall()
+
+    def add_custom_button(self, text: str, url: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT INTO custom_buttons (btn_text, btn_url) VALUES (?, ?)", (text, url))
+            conn.commit()
+
+    def delete_custom_button(self, btn_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM custom_buttons WHERE id = ?", (btn_id,))
+            conn.commit()
+
 user_registry = UserRegistry()
 
 def restricted(func):
@@ -122,7 +180,8 @@ def restricted(func):
 
 def get_admin_menu_keyboard(batch_active=False):
     buttons = [
-        [InlineKeyboardButton("📊 Stats & Blocked Count", callback_data="menu_stats")],
+        [InlineKeyboardButton("📊 Stats & Blocked Count", callback_data="stats_page_0")],
+        [InlineKeyboardButton("⚙️ Edit Welcome Message & Buttons", callback_data="menu_edit_welcome")],
         [InlineKeyboardButton("📦 Start Batch (Choose User)", callback_data="menu_batch_select")],
     ]
     if batch_active:
@@ -137,10 +196,12 @@ def get_admin_menu_keyboard(batch_active=False):
 
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('waiting_for', None)
     is_batch_active = context.user_data.get('batch_active', False)
     text = (
         "👑 **Telegram File Share & Admin Control Panel**\n\n"
-        "Welcome back, Admin! Use the interactive menu below or commands like `/block`, `/unblock`, and `/broadcast` to manage your bot."
+        "Welcome back, Admin! Use the interactive menu below or commands to manage your bot.\n\n"
+        "*(Tip: Send `/start 2` or click 'Preview User Panel' in the menu to test the user-facing welcome panel)*"
     )
     markup = get_admin_menu_keyboard(batch_active=is_batch_active)
     if update.message:
@@ -149,16 +210,56 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
 
 @restricted
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_preview_panel(update)
+
+async def send_preview_panel(update: Update):
+    welcome_text = user_registry.get_setting("welcome_text")
+    btn_pkg_text = user_registry.get_setting("btn_pkg")
+    btn_contact_text = user_registry.get_setting("btn_contact")
+    custom_buttons = user_registry.get_custom_buttons()
+
+    # NOTE: preview buttons use "preview_*" callback data (not "user_*"/"pkg_*"/"pay_*")
+    # so that admin testing the preview never fires a real purchase/contact
+    # request to themselves. See handle_preview_callback.
+    keyboard = [
+        [InlineKeyboardButton(btn_pkg_text, callback_data="preview_buy_package")],
+        [InlineKeyboardButton(btn_contact_text, callback_data="preview_contact_admin")]
+    ]
+
+    for cid, btext, burl in custom_buttons:
+        keyboard.append([InlineKeyboardButton(btext, url=burl)])
+
+    keyboard.extend([
+        [InlineKeyboardButton("✏️ Edit Welcome & Buttons", callback_data="menu_edit_welcome")],
+        [InlineKeyboardButton("« Back to Admin Menu", callback_data="menu_main")]
+    ])
+
+    await update.message.reply_text(
+        f"👀 **[Admin Preview of User Start Menu]**\n\n{welcome_text}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def show_stats_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0, is_edit: bool = False):
     users = user_registry.get_all_users()
     blocked_count = user_registry.get_blocked_count()
-    keyboard = []
+    total_users = len(users)
 
+    ITEMS_PER_PAGE = 15
+    total_pages = (total_users + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE if total_users > 0 else 1
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    current_users = users[start_idx:end_idx]
+
+    keyboard = []
     if not users:
-        text = f"📂 **Bot Statistics**\n\n• Total Active Users: `0`\n• Blocked Users: `{blocked_count}`"
+        text = f"📊 **Bot Statistics**\n\n• Total Users: `0`\n• Blocked Users: `{blocked_count}`"
     else:
-        text = f"📊 **Bot Statistics**\n\n• Total Users: `{len(users)}`\n• Blocked Users: `{blocked_count}`\n\n"
-        for uid, uname, fname, joined in users[:15]:
+        text = f"📊 **Bot Statistics** (Page {page + 1}/{total_pages})\n\n• Total Users: `{total_users}`\n• Blocked Users: `{blocked_count}`\n\n"
+        for uid, uname, fname, joined in current_users:
             username_str = f"@{uname}" if uname else "No username"
             status_tag = " 🚫 [BLOCKED]" if user_registry.is_blocked(uid) else ""
             text += f"• **{fname or 'Unknown'}** ({username_str}){status_tag}\n  ID: `{uid}` | Joined: `{joined}`\n\n"
@@ -167,13 +268,26 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("❌", callback_data=f"del_user_{uid}")
             ])
 
+        # Pagination row
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("« Prev", callback_data=f"stats_page_{page - 1}"))
+        nav_buttons.append(InlineKeyboardButton(f"Page {page + 1}/{total_pages}", callback_data="noop_page"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("Next »", callback_data=f"stats_page_{page + 1}"))
+        keyboard.append(nav_buttons)
+
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
     markup = InlineKeyboardMarkup(keyboard)
 
-    if update.callback_query:
+    if is_edit:
         await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-    elif update.message:
+    else:
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+@restricted
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_stats_page(update, context, page=0, is_edit=False)
 
 async def show_block_user_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, is_edit=False):
     users = user_registry.get_all_users()
@@ -274,15 +388,12 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        text = "📢 **Broadcast Mode**\n\nUsage: `/broadcast <your announcement message>`\nOr choose an action below:"
-        keyboard = [
-            [InlineKeyboardButton("📊 View Stats", callback_data="menu_stats")],
-            [InlineKeyboardButton("« Back to Menu", callback_data="menu_main")]
-        ]
+        text = "📢 **Broadcast Mode**\n\nUsage: `/broadcast <your announcement message>`"
+        keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data="menu_main")]]
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    broadcast_text = " ".join(context.args)
+    broadcast_text = update.message.text.partition(" ")[2]
     users = user_registry.get_all_users()
     success_count = 0
     fail_count = 0
@@ -344,6 +455,39 @@ async def menu_batch_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await show_batch_user_selection(update, context, is_edit=True)
 
+async def show_edit_welcome_menu(query):
+    """Renders the 'Edit Welcome Message & Buttons' screen. Pulled out into its
+    own function (rather than re-invoking menu_callback_handler) so callers
+    like the custom-button delete flow can redraw this screen without
+    re-dispatching a callback query that's already been answered."""
+    current_text = user_registry.get_setting("welcome_text")
+    btn1 = user_registry.get_setting("btn_pkg")
+    btn2 = user_registry.get_setting("btn_contact")
+    custom_buttons = user_registry.get_custom_buttons()
+
+    text = (
+        "⚙️ **Edit Welcome Message & Buttons**\n\n"
+        f"• **Current Welcome Text:**\n`{current_text}`\n\n"
+        f"• **Button 1 (Package):** `{btn1}`\n"
+        f"• **Button 2 (Contact):** `{btn2}`\n"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("✏️ Change Welcome Message", callback_data="edit_msg_prompt")],
+        [InlineKeyboardButton("✏️ Change Button 1 Name", callback_data="edit_btn1_prompt")],
+        [InlineKeyboardButton("✏️ Change Button 2 Name", callback_data="edit_btn2_prompt")],
+        [InlineKeyboardButton("➕ Add 4th Custom Button", callback_data="edit_add_custom_btn")]
+    ]
+
+    if custom_buttons:
+        text += "\n📦 **Custom 4th Buttons Configured:**\n"
+        for cid, btext, burl in custom_buttons:
+            text += f"• `{btext}` -> `{burl}`\n"
+            keyboard.append([InlineKeyboardButton(f"🗑️ Delete Button: {btext}", callback_data=f"del_custom_btn_{cid}")])
+
+    keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="menu_main")])
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
 @restricted
 async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -351,11 +495,57 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
 
     if data == "menu_main":
+        context.user_data.pop('waiting_for', None)
         await cmd_start(update, context)
-    elif data == "menu_stats":
-        await cmd_stats(update, context)
+    elif data.startswith("stats_page_"):
+        page_num = int(data.split("_")[2])
+        await show_stats_page(update, context, page=page_num, is_edit=True)
+    elif data == "noop_page":
+        await query.answer("Current stats page")
     elif data == "menu_batch_select":
         await menu_batch_select(update, context)
+    elif data == "menu_edit_welcome":
+        context.user_data.pop('waiting_for', None)
+        await show_edit_welcome_menu(query)
+
+    elif data == "edit_msg_prompt":
+        context.user_data['waiting_for'] = 'update_welcome'
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="menu_edit_welcome")]]
+        await query.message.edit_text(
+            "📝 **Send the new Welcome Message** you want to set right now in the chat:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    elif data == "edit_btn1_prompt":
+        context.user_data['waiting_for'] = 'update_btn1'
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="menu_edit_welcome")]]
+        await query.message.edit_text(
+            "📝 **Send the new name for Button 1**:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    elif data == "edit_btn2_prompt":
+        context.user_data['waiting_for'] = 'update_btn2'
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="menu_edit_welcome")]]
+        await query.message.edit_text(
+            "📝 **Send the new name for Button 2**:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    elif data == "edit_add_custom_btn":
+        context.user_data['waiting_for'] = 'custom_btn_name'
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="menu_edit_welcome")]]
+        await query.message.edit_text(
+            "➕ **Step 1/2: Send the Button Name** for your new button:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    elif data.startswith("del_custom_btn_"):
+        cid = int(data.split("_")[3])
+        user_registry.delete_custom_button(cid)
+        await query.answer("🗑️ Custom button deleted successfully!", show_alert=True)
+        await show_edit_welcome_menu(query)
+
     elif data.startswith("noop_") or data.startswith("block_noop_") or data.startswith("unblock_noop_"):
         await query.answer("ℹ️ User info button.")
     elif data.startswith("del_user_"):
@@ -363,7 +553,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         user_registry.delete_user(target_id)
         await query.answer(f"🗑️ User {target_id} deleted from database.", show_alert=True)
         try:
-            await cmd_stats(update, context)
+            await show_stats_page(update, context, page=0, is_edit=True)
         except Exception:
             await show_batch_user_selection(update, context, is_edit=True)
     elif data.startswith("block_action_"):
@@ -416,7 +606,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "📦 **Batch Dispatch Mode Guide**\n\n"
             "• **Start Batch:** Click 'Start Batch' or type `/batch_start`.\n"
             "• **Auto-Delete Timer:** Tap buttons to stack auto-delete time.\n"
-            "• **Record & Dispatch:** Send files safely in automated chunks of 100."
+            "• **Record & Dispatch:** Automatically groups photos and videos into albums of up to 10 items."
         )
         keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data="menu_main")]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -443,7 +633,7 @@ async def update_batch_panel(query, target_id, delete_timer_sec):
     text = (
         f"🔴 **Batch Mode Started** for Target ID: `{target_id}`\n\n"
         f"• **Auto-Delete Timer:** `{current_timer_text}`\n\n"
-        "Every file you send now will be recorded. Click 'End & Dispatch Batch' when ready."
+        "Every file you send now will be recorded silently. Click 'End & Dispatch Batch' when ready."
     )
     keyboard = [
         [
@@ -495,7 +685,7 @@ async def cmd_batch_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(
         f"🔴 **Batch Mode Started** for Target ID: `{target_id}`\n\n"
         f"• **Auto-Delete Timer:** `❌ Off (Never Delete)`\n\n"
-        "Every file you send now will be recorded. Click 'End & Dispatch Batch' when ready.",
+        "Every file you send now will be recorded silently. Click 'End & Dispatch Batch' when ready.",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -533,55 +723,86 @@ async def execute_batch_end(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     total_items = len(queue)
-    status_msg = await source_msg.reply_text(f"🚀 Dispatching {total_items} files to user `{target_id}`...")
+    status_msg = await source_msg.reply_text(f"🚀 Processing {total_items} items into albums/files for user `{target_id}`...")
+
+    media_batch = []
+    admin_msg_ids = []
+    failed_items = 0
+
+    for item_data in queue:
+        try:
+            mtype = item_data.get("type")
+            file_id = item_data.get("file_id")
+            adm_id = item_data.get("admin_msg_id")
+            if adm_id:
+                admin_msg_ids.append(adm_id)
+
+            if mtype == "video":
+                media_batch.append(InputMediaVideo(media=file_id))
+            elif mtype == "photo":
+                media_batch.append(InputMediaPhoto(media=file_id))
+            elif mtype == "document":
+                media_batch.append(InputMediaDocument(media=file_id))
+            else:
+                failed_items += 1
+        except Exception as e:
+            logger.error(f"Error parsing queue item: {e}")
+            failed_items += 1
 
     actual_sent_ids = []
-    failed_ids = []
-    chunk_size = 100
+    album_items = [item for item in media_batch if isinstance(item, (InputMediaVideo, InputMediaPhoto))]
+    document_items = [item for item in media_batch if isinstance(item, InputMediaDocument)]
 
-    for i in range(0, total_items, chunk_size):
-        chunk = queue[i:i + chunk_size]
+    for i in range(0, len(album_items), 10):
+        chunk = album_items[i:i + 10]
         try:
-            # Try the fast bulk copy first
-            sent_msg_ids = await context.bot.copy_messages(
+            sent_messages = await context.bot.send_media_group(
                 chat_id=target_id,
-                from_chat_id=ALLOWED_USER_ID,
-                message_ids=chunk
+                media=chunk
             )
-            actual_sent_ids.extend([m.message_id for m in sent_msg_ids])
+            actual_sent_ids.extend([m.message_id for m in sent_messages])
         except Exception as e:
-            logger.warning(f"Chunk copy failed ({e}), falling back to one-by-one for this chunk")
-            # Fall back: copy one at a time so a single bad message doesn't kill the whole chunk
-            for msg_id in chunk:
+            logger.warning(f"Media group chunk failed ({e}), falling back to individual sends")
+            for item in chunk:
                 try:
-                    sent = await context.bot.copy_message(
-                        chat_id=target_id,
-                        from_chat_id=ALLOWED_USER_ID,
-                        message_id=msg_id
-                    )
+                    if isinstance(item, InputMediaVideo):
+                        sent = await context.bot.send_video(chat_id=target_id, video=item.media)
+                    else:
+                        sent = await context.bot.send_photo(chat_id=target_id, photo=item.media)
                     actual_sent_ids.append(sent.message_id)
                 except Exception as inner_e:
-                    logger.error(f"Skipping message {msg_id}: {inner_e}")
-                    failed_ids.append(msg_id)
-                await asyncio.sleep(0.1)  # tiny pacing to avoid flood limits
+                    logger.error(f"Fallback item send failed: {inner_e}")
+                    failed_items += 1
+                await asyncio.sleep(0.2)
 
-        if i + chunk_size < total_items:
-            await asyncio.sleep(2.5)
+        await asyncio.sleep(1.0)
 
-    if delete_timer > 0 and actual_sent_ids:
-        asyncio.create_task(delete_messages_after_delay(context.bot, target_id, actual_sent_ids, delete_timer))
-        timer_str = f"⏱️ Auto-deleting in {delete_timer}s"
+    for doc in document_items:
+        try:
+            sent = await context.bot.send_document(chat_id=target_id, document=doc.media)
+            actual_sent_ids.append(sent.message_id)
+        except Exception as e:
+            logger.error(f"Document send failed: {e}")
+            failed_items += 1
+        await asyncio.sleep(0.2)
+
+    if delete_timer > 0:
+        if actual_sent_ids:
+            asyncio.create_task(delete_messages_after_delay(context.bot, target_id, actual_sent_ids, delete_timer))
+        if admin_msg_ids:
+            asyncio.create_task(delete_messages_after_delay(context.bot, ALLOWED_USER_ID, admin_msg_ids, delete_timer))
+        timer_str = f"⏱️ Auto-deleting in {delete_timer}s (User & Admin chat)"
     else:
         timer_str = "No auto-delete"
 
     result_text = (
-        f"✅ **Batch Delivery Finished**\n\n"
+        f"✅ **Batch Album Delivery Finished**\n\n"
         f"• Target ID: `{target_id}`\n"
-        f"• Successfully Sent: `{len(actual_sent_ids)}` / `{total_items}`\n"
+        f"• Successfully Sent: `{len(actual_sent_ids)}` files\n"
         f"• Timer: `{timer_str}`"
     )
-    if failed_ids:
-        result_text += f"\n\n⚠️ Skipped `{len(failed_ids)}` invalid/undeliverable message(s): `{failed_ids}`"
+    if failed_items > 0:
+        result_text += f"\n\n⚠️ Failed/Skipped items: `{failed_items}`"
 
     await status_msg.edit_text(result_text, parse_mode="Markdown")
 
@@ -595,9 +816,70 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not message:
         return
 
+    waiting_state = context.user_data.get('waiting_for')
+    if waiting_state:
+        text_input = message.text
+        if waiting_state == 'update_welcome':
+            user_registry.set_setting("welcome_text", text_input)
+            context.user_data.pop('waiting_for', None)
+            await message.reply_text(f"✅ Welcome message successfully updated to:\n`{text_input}`", parse_mode="Markdown")
+            return
+        elif waiting_state == 'update_btn1':
+            user_registry.set_setting("btn_pkg", text_input)
+            context.user_data.pop('waiting_for', None)
+            await message.reply_text(f"✅ Button 1 name updated to: `{text_input}`", parse_mode="Markdown")
+            return
+        elif waiting_state == 'update_btn2':
+            user_registry.set_setting("btn_contact", text_input)
+            context.user_data.pop('waiting_for', None)
+            await message.reply_text(f"✅ Button 2 name updated to: `{text_input}`", parse_mode="Markdown")
+            return
+        elif waiting_state == 'custom_btn_name':
+            context.user_data['temp_custom_btn_name'] = text_input
+            context.user_data['waiting_for'] = 'custom_btn_url'
+            keyboard = [[InlineKeyboardButton("« Back to Menu", callback_data="menu_edit_welcome")]]
+            await message.reply_text(
+                f"🔗 **Step 2/2: Send the URL/Link** for button `{text_input}`:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            return
+        elif waiting_state == 'custom_btn_url':
+            bname = context.user_data.pop('temp_custom_btn_name', 'Button')
+            burl = text_input
+            context.user_data.pop('waiting_for', None)
+            user_registry.add_custom_button(bname, burl)
+            await message.reply_text(
+                f"✅ **Custom Button Added Successfully!**\n• Name: `{bname}`\n• Link: `{burl}`",
+                parse_mode="Markdown"
+            )
+            return
+
     if context.user_data.get('batch_active'):
-        context.user_data['batch_queue'].append(message.message_id)
-        await message.set_reaction("👀")
+        # Capture ALL files—whether they are sent individually or as part of a media group
+        if message.video:
+            context.user_data['batch_queue'].append({
+                "type": "video", 
+                "file_id": message.video.file_id, 
+                "admin_msg_id": message.message_id
+            })
+        elif message.photo:
+            context.user_data['batch_queue'].append({
+                "type": "photo", 
+                "file_id": message.photo[-1].file_id, 
+                "admin_msg_id": message.message_id
+            })
+        elif message.document:
+            context.user_data['batch_queue'].append({
+                "type": "document", 
+                "file_id": message.document.file_id, 
+                "admin_msg_id": message.message_id
+            })
+        
+        try:
+            await message.set_reaction("👀")
+        except Exception:
+            pass
         return
 
     if message.reply_to_message:
@@ -616,6 +898,38 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 await message.reply_text(f"⚠️ Error: {e}")
 
+async def cmd_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id == ALLOWED_USER_ID:
+        return
+
+    if user_registry.is_blocked(user.id):
+        await update.message.reply_text("❌ You have been blocked from using this bot.")
+        return
+
+    user_registry.add_user(user.id, user.username, user.first_name)
+    args = context.args
+
+    if args and args[0] == "2":
+        welcome_text = user_registry.get_setting("welcome_text")
+        btn_pkg_text = user_registry.get_setting("btn_pkg")
+        btn_contact_text = user_registry.get_setting("btn_contact")
+        custom_buttons = user_registry.get_custom_buttons()
+
+        keyboard = [
+            [InlineKeyboardButton(btn_pkg_text, callback_data="user_buy_package")],
+            [InlineKeyboardButton(btn_contact_text, callback_data="user_contact_admin")]
+        ]
+        for cid, btext, burl in custom_buttons:
+            keyboard.append([InlineKeyboardButton(btext, url=burl)])
+
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text("සාදරයෙන් පිලිගන්නවා 💕, ඇඩ්මින් ට එවන්න ඔනෙ මැසෙජ් එක ටයිප් කරලා එවන්න,")
+
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message
@@ -629,15 +943,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text("❌ You have been blocked from using this bot.")
         return
 
-    if message.text and message.text.startswith("/start"):
-        await message.reply_text(
-            "සාදරයෙන් පිලිගන්නවා 💕, ඇඩ්මින් ට එවන්න ඔනෙ මැසෙජ් එක ටයිප් කරලා එවන්න, "
-        )
-        return
-
     user_registry.add_user(user.id, user.username, user.first_name)
 
-    # Make the name clickable using the Telegram user link scheme
     clickable_name = f"[{user.first_name}](tg://user?id={user.id})"
     header = f"📩 **msg/ From:** {clickable_name} (`{user.id}`)\n\n"
 
@@ -652,10 +959,152 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"User message forward error: {e}")
 
+async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = query.from_user
+
+    if data == "user_start_menu":
+        welcome_text = user_registry.get_setting("welcome_text")
+        btn_pkg_text = user_registry.get_setting("btn_pkg")
+        btn_contact_text = user_registry.get_setting("btn_contact")
+        custom_buttons = user_registry.get_custom_buttons()
+
+        keyboard = [
+            [InlineKeyboardButton(btn_pkg_text, callback_data="user_buy_package")],
+            [InlineKeyboardButton(btn_contact_text, callback_data="user_contact_admin")]
+        ]
+        for cid, btext, burl in custom_buttons:
+            keyboard.append([InlineKeyboardButton(btext, url=burl)])
+
+        await query.message.edit_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data == "user_buy_package":
+        keyboard = [
+            [InlineKeyboardButton("5$ Package", callback_data="pkg_5")],
+            [InlineKeyboardButton("8$ Package", callback_data="pkg_8")],
+            [InlineKeyboardButton("13$ Package", callback_data="pkg_13")],
+            [InlineKeyboardButton("« Back", callback_data="user_start_menu")]
+        ]
+        await query.message.edit_text("What package are you buying?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data in ["pkg_5", "pkg_8", "pkg_13"]:
+        amount = data.split("_")[1]
+        context.user_data['selected_pkg'] = amount
+        keyboard = [
+            [InlineKeyboardButton("Binance Payment", callback_data="pay_binance")],
+            [InlineKeyboardButton("Star Payment", callback_data="pay_star")],
+            [InlineKeyboardButton("« Back", callback_data="user_buy_package")]
+        ]
+        await query.message.edit_text("Choose your payment method:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data in ["pay_binance", "pay_star"]:
+        method = "binance payment" if data == "pay_binance" else "star payment"
+        pkg_amount = context.user_data.get('selected_pkg', 'unknown')
+        
+        clickable_name = f"[{user.first_name}](tg://user?id={user.id})"
+        admin_text = f"📩 **Purchase Request** from {clickable_name} (`{user.id}`)\n\nAdmin i need to buy {pkg_amount}$ package with {method}"
+        
+        sent_to_admin = await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=admin_text, parse_mode="Markdown")
+        user_registry.map_admin_message(sent_to_admin.message_id, user.id)
+
+        await query.message.reply_text("✅ Your request has been sent to the admin! They will contact you shortly.")
+
+    elif data == "user_contact_admin":
+        clickable_name = f"[{user.first_name}](tg://user?id={user.id})"
+        admin_text = f"📩 **Contact Request** from {clickable_name} (`{user.id}`)\n\nAdmin i need to know details package"
+        
+        sent_to_admin = await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=admin_text, parse_mode="Markdown")
+        user_registry.map_admin_message(sent_to_admin.message_id, user.id)
+
+        await query.message.reply_text("✅ Your message has been sent to the admin!")
+
+async def handle_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles button taps inside the ADMIN-ONLY /start_2 preview panel.
+    Mirrors the real user flow's screens for visual testing, but never
+    contacts the admin or writes a purchase/contact request — it's a dry run."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "preview_start_menu":
+        welcome_text = user_registry.get_setting("welcome_text")
+        btn_pkg_text = user_registry.get_setting("btn_pkg")
+        btn_contact_text = user_registry.get_setting("btn_contact")
+        custom_buttons = user_registry.get_custom_buttons()
+
+        keyboard = [
+            [InlineKeyboardButton(btn_pkg_text, callback_data="preview_buy_package")],
+            [InlineKeyboardButton(btn_contact_text, callback_data="preview_contact_admin")]
+        ]
+        for cid, btext, burl in custom_buttons:
+            keyboard.append([InlineKeyboardButton(btext, url=burl)])
+        keyboard.append([InlineKeyboardButton("« Back to Admin Menu", callback_data="menu_main")])
+
+        await query.message.edit_text(
+            f"👀 **[Admin Preview of User Start Menu]**\n\n{welcome_text}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    elif data == "preview_buy_package":
+        keyboard = [
+            [InlineKeyboardButton("5$ Package", callback_data="preview_pkg_5")],
+            [InlineKeyboardButton("8$ Package", callback_data="preview_pkg_8")],
+            [InlineKeyboardButton("13$ Package", callback_data="preview_pkg_13")],
+            [InlineKeyboardButton("« Back", callback_data="preview_start_menu")]
+        ]
+        await query.message.edit_text(
+            "👀 **[Preview]** What package are you buying?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    elif data in ["preview_pkg_5", "preview_pkg_8", "preview_pkg_13"]:
+        amount = data.split("_")[2]
+        keyboard = [
+            [InlineKeyboardButton("Binance Payment", callback_data=f"preview_pay_binance_{amount}")],
+            [InlineKeyboardButton("Star Payment", callback_data=f"preview_pay_star_{amount}")],
+            [InlineKeyboardButton("« Back", callback_data="preview_buy_package")]
+        ]
+        await query.message.edit_text(
+            "👀 **[Preview]** Choose your payment method:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("preview_pay_"):
+        parts = data.split("_")  # preview, pay, method, amount
+        method_label = "Binance Payment" if parts[2] == "binance" else "Star Payment"
+        amount = parts[3]
+        keyboard = [[InlineKeyboardButton("« Back to Admin Menu", callback_data="menu_main")]]
+        await query.message.edit_text(
+            f"👀 **[Preview only — nothing was sent]**\n\n"
+            f"This is exactly what a real buyer would trigger: a message to you reading\n"
+            f"`admin i need to buy {amount}$ package with {method_label.lower()}`",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    elif data == "preview_contact_admin":
+        keyboard = [[InlineKeyboardButton("« Back to Admin Menu", callback_data="menu_main")]]
+        await query.message.edit_text(
+            "👀 **[Preview only — nothing was sent]**\n\n"
+            "This is exactly what a real user would trigger: a message to you reading\n"
+            "`admin i need to know details package`",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
 async def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", cmd_start, filters.User(ALLOWED_USER_ID)))
+    application.add_handler(CommandHandler("start_2", cmd_start_2, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("stats", cmd_stats, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("block", cmd_block, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("unblock", cmd_unblock, filters.User(ALLOWED_USER_ID)))
@@ -663,24 +1112,27 @@ async def main():
     application.add_handler(CommandHandler("batch_start", cmd_batch_start, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("batch_end", cmd_batch_end, filters.User(ALLOWED_USER_ID)))
 
-    application.add_handler(CallbackQueryHandler(menu_callback_handler, pattern="^(menu_|batch_choose_|batch_timer_|del_user_|block_action_|unblock_action_|noop_|block_noop_|unblock_noop_)"))
+    application.add_handler(CommandHandler("start", cmd_user_start, ~filters.User(ALLOWED_USER_ID)))
+
+    application.add_handler(CallbackQueryHandler(menu_callback_handler, pattern="^(menu_|batch_choose_|batch_timer_|del_user_|block_action_|unblock_action_|noop_|block_noop_|unblock_noop_|edit_|del_custom_btn_|stats_page_|noop_page)"))
+    application.add_handler(CallbackQueryHandler(handle_preview_callback, pattern="^preview_"))
+    application.add_handler(CallbackQueryHandler(handle_user_callback, pattern="^(user_|pkg_|pay_)"))
 
     application.add_handler(MessageHandler(filters.User(ALLOWED_USER_ID) & ~filters.COMMAND, handle_admin_message))
     application.add_handler(MessageHandler(~filters.User(ALLOWED_USER_ID), handle_user_message))
 
-    logger.info("File Share Bot started successfully with Block/Unblock, Broadcast, and Batch capabilities.")
+    logger.info("File Share Bot started successfully with silent batch capture, pagination, and album dispatching.")
     await application.initialize()
     await application.start()
 
-    # 1. Set global commands visible to EVERYONE (only show start)
     await application.bot.set_my_commands(
         [BotCommand("start", "Start the bot")],
         scope=BotCommandScopeDefault()
     )
 
-    # 2. Set admin-only commands visible ONLY to your Admin ID
     await application.bot.set_my_commands([
         BotCommand("start", "Open Admin Control Panel"),
+        BotCommand("start_2", "Preview User Welcome Panel"),
         BotCommand("stats", "View Active Users & Blocked Count"),
         BotCommand("block", "Block a user (reply or ID)"),
         BotCommand("unblock", "Unblock a user (reply or ID)"),
