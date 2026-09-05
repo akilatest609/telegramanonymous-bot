@@ -24,8 +24,12 @@ from telegram.ext import (
 )
 
 # === PASTE YOUR NEW TOKEN AND ADMIN ID HERE ===
-BOT_TOKEN = "8951474107:AAHLBI_7fIOjw70mNg5_qcPu2v9UGyCTk6k"
-ALLOWED_USER_ID = 8536087082
+import os
+
+# === Token & Admin ID now come from environment variables, not hardcoded ===
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
+# ===============================================
 # ===============================================
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
