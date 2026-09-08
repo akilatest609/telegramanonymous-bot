@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import sqlite3
 from functools import wraps
 from telegram import (
@@ -14,6 +13,7 @@ from telegram import (
     InputMediaVideo,
     InputMediaPhoto,
     InputMediaDocument,
+    InputMediaAudio,
 )
 from telegram.ext import (
     Application,
@@ -23,8 +23,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import RetryAfter, Forbidden
+import batch_links
 
-# === PASTE YOUR NEW TOKEN AND ADMIN ID HERE ===
+import os
+
+# === Config comes from environment variables — see .env.example ===
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 # ===============================================
@@ -167,6 +171,7 @@ class UserRegistry:
             conn.commit()
 
 user_registry = UserRegistry()
+batch_links.init_batch_tables(user_registry.db_path)
 
 def restricted(func):
     @wraps(func)
@@ -184,6 +189,7 @@ def get_admin_menu_keyboard(batch_active=False):
         [InlineKeyboardButton("📊 Stats & Blocked Count", callback_data="stats_page_0")],
         [InlineKeyboardButton("⚙️ Edit Welcome Message & Buttons", callback_data="menu_edit_welcome")],
         [InlineKeyboardButton("📦 Start Batch (Choose User)", callback_data="menu_batch_select")],
+        [InlineKeyboardButton("🔗 Create Share Link", callback_data="menu_new_link")],
         [InlineKeyboardButton("📢 Broadcast Message", callback_data="menu_broadcast_select")],
     ]
     if batch_active:
@@ -634,6 +640,8 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Current page")
     elif data == "menu_batch_select":
         await menu_batch_select(update, context)
+    elif data == "menu_new_link":
+        await batch_links.cmd_new_link_batch(update, context)
     elif data == "menu_edit_welcome":
         context.user_data.pop('waiting_for', None)
         await show_edit_welcome_menu(query)
@@ -682,8 +690,9 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             keyboard = [[InlineKeyboardButton("« Cancel", callback_data="menu_main")]]
             await query.message.edit_text(
                 f"📝 Send the message to broadcast to `{len(targets)}` selected user(s) ({timer_note}).\n\n"
-                "It will be sent exactly as you type it (plain text), and any links you "
-                "include will be automatically clickable.",
+                "You can send plain text (sent exactly as typed, links auto-clickable), or "
+                "a single photo, video, audio, voice note, document, animation/GIF, or "
+                "sticker — any caption on it will be included too.",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
             )
@@ -911,6 +920,61 @@ async def delete_messages_after_delay(bot, chat_id, message_ids, delay_seconds):
         except Exception as e:
             logger.error(f"Failed to auto-delete message {msg_id}: {e}")
 
+async def finalize_album_broadcast(context: ContextTypes.DEFAULT_TYPE, admin_chat_id: int):
+    # Debounce: wait for more album parts to arrive before sending.
+    await asyncio.sleep(1.5)
+
+    items = context.user_data.pop('broadcast_album_items', [])
+    context.user_data.pop('broadcast_album_task', None)
+    targets = context.user_data.pop('broadcast_targets', [])
+    delete_timer = context.user_data.pop('broadcast_delete_timer', 0)
+    context.user_data.pop('waiting_for', None)
+    context.user_data.pop('broadcast_excluded', None)
+
+    if not items or not targets:
+        return
+
+    media_group = []
+    for i, m in enumerate(items):
+        caption = m.caption if i == 0 else None  # Telegram only shows the first item's caption
+        if m.photo:
+            media_group.append(InputMediaPhoto(m.photo[-1].file_id, caption=caption))
+        elif m.video:
+            media_group.append(InputMediaVideo(m.video.file_id, caption=caption))
+        elif m.document:
+            media_group.append(InputMediaDocument(m.document.file_id, caption=caption))
+        elif m.audio:
+            media_group.append(InputMediaAudio(m.audio.file_id, caption=caption))
+
+    success_count = 0
+    fail_count = 0
+    for uid in targets:
+        if user_registry.is_blocked(uid):
+            continue
+        try:
+            sent_list = await context.bot.send_media_group(chat_id=uid, media=media_group)
+            success_count += 1
+            if delete_timer > 0:
+                msg_ids = [s.message_id for s in sent_list]
+                asyncio.create_task(
+                    delete_messages_after_delay(context.bot, uid, msg_ids, delete_timer)
+                )
+        except Exception as e:
+            logger.error(f"Album broadcast to {uid} failed: {e}")
+            fail_count += 1
+
+    timer_line = f"• Auto-Delete: `⏱️ {delete_timer}s`\n" if delete_timer > 0 else ""
+    await context.bot.send_message(
+        chat_id=admin_chat_id,
+        text=(
+            f"📢 **Broadcast Results** (album, {len(media_group)} item(s))\n\n"
+            f"• Sent to: `{success_count}` user(s)\n"
+            f"• Failed: `{fail_count}` user(s)\n"
+            f"{timer_line}"
+        ),
+        parse_mode="Markdown"
+    )
+
 async def execute_batch_end(update: Update, context: ContextTypes.DEFAULT_TYPE, is_callback=False):
     if not context.user_data.get('batch_active'):
         msg_text = "⚠️ No active batch session found. Start one from the menu or with `/batch_start`."
@@ -1036,6 +1100,12 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not message:
         return
 
+    bot_username = context.bot_data.get('bot_username')
+    if await batch_links.try_capture_custom_timer(update, context):
+        return
+    if await batch_links.try_capture_for_link_batch(update, context, bot_username, user_registry.db_path):
+        return
+
     waiting_state = context.user_data.get('waiting_for')
     if waiting_state:
         text_input = message.text
@@ -1076,30 +1146,62 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         elif waiting_state == 'broadcast_message':
             targets = context.user_data.get('broadcast_targets', [])
+            if not targets:
+                context.user_data.pop('waiting_for', None)
+                context.user_data.pop('broadcast_targets', None)
+                context.user_data.pop('broadcast_excluded', None)
+                context.user_data.pop('broadcast_delete_timer', None)
+                await message.reply_text("⚠️ No recipients were selected. Nothing was sent.")
+                return
+
+            if message.media_group_id:
+                # Part of an album: buffer it and (re)start the debounce timer.
+                # Telegram sends each album item as a separate update, so we wait
+                # briefly to collect them all before sending as one media group.
+                context.user_data.setdefault('broadcast_album_items', []).append(message)
+                old_task = context.user_data.get('broadcast_album_task')
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                context.user_data['broadcast_album_task'] = asyncio.create_task(
+                    finalize_album_broadcast(context, message.chat_id)
+                )
+                return
+
             delete_timer = context.user_data.get('broadcast_delete_timer', 0)
             context.user_data.pop('waiting_for', None)
             context.user_data.pop('broadcast_targets', None)
             context.user_data.pop('broadcast_excluded', None)
             context.user_data.pop('broadcast_delete_timer', None)
 
-            if not targets:
-                await message.reply_text("⚠️ No recipients were selected. Nothing was sent.")
-                return
+            is_plain_text = bool(message.text) and not (
+                message.photo or message.video or message.document or
+                message.audio or message.voice or message.animation or
+                message.video_note or message.sticker
+            )
 
-            broadcast_text = text_input
             success_count = 0
             fail_count = 0
             for uid in targets:
                 if user_registry.is_blocked(uid):
                     continue
                 try:
-                    # Plain text (no parse_mode): sends exactly what was typed,
-                    # underscores/asterisks aren't treated as formatting, and
-                    # Telegram still auto-links any URLs in the text.
-                    sent = await context.bot.send_message(
-                        chat_id=uid,
-                        text=f"📢 Announcement:\n\n{broadcast_text}"
-                    )
+                    if is_plain_text:
+                        # Plain text (no parse_mode): sends exactly what was typed,
+                        # underscores/asterisks aren't treated as formatting, and
+                        # Telegram still auto-links any URLs in the text.
+                        sent = await context.bot.send_message(
+                            chat_id=uid,
+                            text=f"📢 Announcement:\n\n{message.text}"
+                        )
+                    else:
+                        # copy_message handles photo/video/audio/document/voice/
+                        # animation/sticker/etc. and preserves the original caption,
+                        # without leaving a "Forwarded from" tag on the recipient's side.
+                        sent = await context.bot.copy_message(
+                            chat_id=uid,
+                            from_chat_id=message.chat_id,
+                            message_id=message.message_id
+                        )
                     success_count += 1
                     if delete_timer > 0:
                         asyncio.create_task(
@@ -1172,6 +1274,10 @@ async def cmd_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_registry.add_user(user.id, user.username, user.first_name)
     args = context.args
+
+    if args and args[0].startswith(batch_links.BATCH_LINK_PREFIX):
+        await batch_links.deliver_batch_to_user(update, context, args[0], user_registry.db_path)
+        return
 
     if args and args[0] == "2":
         welcome_text = user_registry.get_setting("welcome_text")
@@ -1371,6 +1477,12 @@ async def main():
     application.add_handler(CommandHandler("broadcast", cmd_broadcast, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("batch_start", cmd_batch_start, filters.User(ALLOWED_USER_ID)))
     application.add_handler(CommandHandler("batch_end", cmd_batch_end, filters.User(ALLOWED_USER_ID)))
+    application.add_handler(CommandHandler("new_link", restricted(batch_links.cmd_new_link_batch), filters.User(ALLOWED_USER_ID)))
+    application.add_handler(CommandHandler(
+        "delete_batch",
+        restricted(lambda u, c: batch_links.cmd_delete_batch(u, c, user_registry.db_path)),
+        filters.User(ALLOWED_USER_ID)
+    ))
 
     application.add_handler(CommandHandler("start", cmd_user_start, ~filters.User(ALLOWED_USER_ID)))
 
@@ -1378,6 +1490,7 @@ async def main():
         menu_callback_handler,
         pattern="^(menu_|batch_choose_|batch_timer_|del_user_|confirm_del_|block_action_|unblock_action_|noop_|block_noop_|unblock_noop_|edit_|del_custom_btn_|stats_page_|block_page_|unblock_page_|noop_page|bc_)"
     ))
+    application.add_handler(CallbackQueryHandler(batch_links.handle_link_timer_choice, pattern="^linktimer_"))
     application.add_handler(CallbackQueryHandler(handle_preview_callback, pattern="^preview_"))
     application.add_handler(CallbackQueryHandler(handle_user_callback, pattern="^(user_|pkg_|pay_)"))
 
@@ -1386,6 +1499,7 @@ async def main():
 
     logger.info("File Share Bot started successfully with enhanced user-friendliness features.")
     await application.initialize()
+    application.bot_data['bot_username'] = application.bot.username
     await application.start()
 
     await application.bot.set_my_commands(
