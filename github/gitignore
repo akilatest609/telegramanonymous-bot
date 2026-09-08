@@ -1,4 +1,0 @@
-.env
-bot_users.db
-__pycache__/
-*.pyc
